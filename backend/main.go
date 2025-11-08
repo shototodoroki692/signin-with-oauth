@@ -1,6 +1,6 @@
 package main
 
-import "backend/backend/api"
+import "backend/api"
 
 func main() {
 	// instancier une base de donnée
