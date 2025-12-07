@@ -28,13 +28,16 @@ func (s *APIServer) Run() {
 
 	// routes de notre API
 	router.HandleFunc("/", makeErrorHandler(s.handleRootRequest))
+	router.HandleFunc("/auth/authorize", makeErrorHandler(s.handleAuthorize))
+	router.HandleFunc("/auth/callback", makeErrorHandler(s.handleCallback))
+	router.HandleFunc("/auth/token", makeErrorHandler(s.handleToken))
 
 	// débug
 	log.Printf("lancement sur serveur d'API sur le port n°%s ...\n", s.listenPort)
 
 	// exécution de notre serveur d'API
 	if err := http.ListenAndServe(":"+s.listenPort, router); err != nil {
-		log.Println("erreur lors de l'exécution du serveur")
+		log.Printf("erreur lors de l'exécution du serveur:\n%v\n", err)
 	}
 }
 
@@ -49,19 +52,24 @@ func makeErrorHandler(f APIHandler) func(w http.ResponseWriter, r *http.Request)
 			// débug
 			log.Println("erreur survenue:\n", err)
 
-			writeJSON(w, http.StatusInternalServerError, APIError{Error: "internal-server-error"})
+			respondWithError(w, http.StatusInternalServerError, "internal-server-error")
 		}
 	}
 }
 
-// writeJSON permet de renvoyer du JSON en réponse au client
-func writeJSON(w http.ResponseWriter, status int, content any) error {
+// respondWithJSON permet de renvoyer du JSON en réponse au client
+func respondWithJSON(w http.ResponseWriter, status int, content any) error {
 	// définition de l'en-tête de la réponse
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(status)
 
 	// renvoyer le contenu au format JSON
 	return json.NewEncoder(w).Encode(content)
+}
+
+// respondWithError permet de renvoyer une erreur en réponse au client
+func respondWithError(w http.ResponseWriter, status int, message string) error {
+	return respondWithJSON(w, status, APIError{Error: message})
 }
 
 // APIMessage correspond au format d'un message renvoyé par notre API au client
