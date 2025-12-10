@@ -11,7 +11,7 @@ export const LAN_BACKEND_IP_ADDR = process.env.EXPO_PUBLIC_LAN_BACKEND_IP_ADDR;
 export const BACKEND_BASE_URL = `http://${LAN_BACKEND_IP_ADDR}:3000`;
 
 // Constantes d'authentification
-export const ACCESS_TOKEN_NAME = "access_token";
+export const ACCESS_TOKEN_NAME = "accessToken";
 export const REFRESH_TOKEN_NAME = "session_token";
 export const ACCESS_TOKEN_MAX_AGE = 20; // 20 secondes
 export const SESSION_TOKEN_MAX_AGE = 30 * 25 * 60 * 60 // 30 jours en secondes

@@ -78,17 +78,27 @@ export default function HomeScreen() {
         <HelloWave />
       </ThemedView>
 
-      {/* status de l'utilisateur */}
-      <Text style={styles.text}>Utilisateur connecté: {JSON.stringify(user)}</Text>
-
       {/* Affichage du status du serveur */}
       <MessageContainer 
         message={isBackendAvailable ? 'Serveur backend disponible' : 'Serveur backend indisponible'}
         type={isBackendAvailable ? 'success' : 'error'}
       />
 
-      {/* si l'utilisateur est connecté, afficher un bouton de déconnexion, sinon afficher le formulaire de connexion */}
-      { user ? <Button title="Se déconnecter" onPress={() => signOut()} /> : <LoginForm />}
+      {user ? 
+        <>
+          {/* informations de l'utilisateur */}
+          <Text style={styles.text1}>Utilisateur connecté:</Text>
+          <Text style={styles.text}>Pseudo: {user?.name}</Text>
+          <Text style={styles.text}>Email: {user?.email}</Text>
+
+          {/* Bouton de déconnexion */}
+          <Button title="Se déconnecter" onPress={() => signOut()} /> 
+        </>
+      : 
+        // Formulaire de connexion
+        <LoginForm />
+      }
+
     </ParallaxScrollView>
   );
 }
@@ -114,6 +124,11 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  text1: {
+    color: "#ffffff",
+    fontSize: 20,
+    fontWeight: 700,
   },
   text: {
     color: "#ffffff",
