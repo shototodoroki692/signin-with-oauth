@@ -31,6 +31,9 @@ func (s *APIServer) Run() {
 	router.HandleFunc("/auth/authorize", makeErrorHandler(s.handleAuthorize))
 	router.HandleFunc("/auth/callback", makeErrorHandler(s.handleCallback))
 	router.HandleFunc("/auth/token", makeErrorHandler(s.handleToken))
+	router.HandleFunc("/auth/session", makeErrorHandler(s.handleSession))
+	router.HandleFunc("/auth/signout", makeErrorHandler(s.handleSignout))
+	router.HandleFunc("/protected/data", s.authMiddleware(makeErrorHandler(s.handleData)))
 
 	// débug
 	log.Printf("lancement sur serveur d'API sur le port n°%s ...\n", s.listenPort)

@@ -39,7 +39,7 @@ const AuthContext = React.createContext({
     user: null as AuthUser | null,
     signIn: () => {},
     signOut: () => {},
-    fetchWithAuth: async (url: string, options?: RequestInit) => Promise.resolve(new Response()),
+    fetchWithAuth: (url: string, options: RequestInit) => Promise.resolve(new Response()),
     isLoading: false,
     error: null as AuthError | null,
 });
@@ -89,6 +89,62 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         handleResponse();
     }, [response]);
 
+    // restaurer la session de l'utilisateur dès qu'il rafraîchit sa page web
+    // Cela ne fonctionne que si le cookie est encore valide au moment du
+    // rafraîchissement de la page
+    React.useEffect(() => {
+        const restoreSession = async () => {
+            setIsLoading(true);
+            try {
+                if (isWeb) {
+                    const sessionResponse = await fetch(`${BACKEND_BASE_URL}/auth/session`, {
+                        method: "GET",
+                        credentials: "include" // inclu le cookie dans la requête
+                    });
+
+                    if (sessionResponse.ok) {
+                        const userData = await sessionResponse.json();
+                        setUser(userData as AuthUser);
+                    }
+                } else {
+                    // Pour les clients natifs, essayer d'abord d'utiliser l'access token
+                    // mis dans le store
+                    const storedAccessToken = await tokenCache?.getToken(ACCESS_TOKEN_NAME);
+
+                    if (storedAccessToken) {
+                        try {
+                            const decoded = jose.decodeJwt(storedAccessToken);
+
+                            // vérifier si l'accesstoken a expiré
+                            const exp = (decoded as any).exp;
+                            const now = Math.floor(Date.now() / 1000);
+
+                            if (exp && exp > now) {
+
+                                // le token d'accès est encore valide
+                                setAccessToken(storedAccessToken);
+                                setUser(decoded as AuthUser);
+                            } else {
+                                // récupérer le refresh token si besoin (il n'y en a pas
+                                // dans cette application de démo)
+
+                                setUser(null);
+                                tokenCache?.deleteToken(ACCESS_TOKEN_NAME);
+                            }
+                        } catch(e) {
+                            console.log("erreur ce mise à jour de l'accès token:\n", e);
+                        }
+                    }
+                }
+            } catch(e) {
+                console.log("erreur lors de la restauration de la session de l'utilisateur:\n", e)
+            } finally {
+                setIsLoading(false)
+            }
+        }
+        restoreSession();
+    }, [isWeb]);
+
     // handleResponse permet de traiter la réponse renvoyée suite à une demande d'authentification
     const handleResponse = async () => {
         if (response?.type === "success") {
@@ -123,6 +179,14 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                     formData.append("platform", "web")
                 }
 
+                // récupérer le code verifier de la requête
+                // Il s'agit du même verifier que celui utilisé pour générer le challenge pour le code
+                if (request?.codeVerifier) {
+                    formData.append("code_verifier", request.codeVerifier);
+                } else {
+                    console.warn("aucun code verifier n'a été trouvé dans la requête")
+                }
+
                 // envoyer notre code d'autorisation à notre endpoint /auth/token
                 // Le serveur va échanger ce code pour obtenir en retour les tokens d'autorisation
                 // (access et refresh token) de notre serveur.
@@ -151,14 +215,37 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                 // );
 
                 if (isWeb) {
-                    const sessionResponse = await fetch(`${BACKEND_BASE_URL}/auth/session`, {
-                        method: "GET",
-                        credentials: "include",
-                    });
-                
-                    if (sessionResponse.ok) {
-                        const sessionData = await sessionResponse.json();
-                        setUser(sessionData as AuthUser);
+                    // Pour le web, le serveur met le token dans un cookie http-only
+                    // Nous avons juste à récupérer les données de l'utilisateur dans la reponse
+                    const userData = await tokenResponse.json();
+
+                    if(userData.success) {
+                        // débug
+                        console.log("demande des informations de session")
+
+                        // récupérer la session pour obtenir les données de l'utilisateur
+                        // Cela assure que nous avons les dernières informations mise à jour.
+                        const sessionResponse = await fetch(`${BACKEND_BASE_URL}/auth/session`, {
+                            method: "GET",
+                            credentials: "include",
+                        });
+
+                        // ATTENTION:
+                        // j'ai l'erreur suivante dans mon navigateur une fois le fetch
+                        // réalisé:
+                        // has been blocked by CORS policy: No 'Access-Control-Allow-Origin'
+                        //
+                        // Pour l'instant je ne m'en occupe pas car elle concerne les 
+                        // clients web uniquement 
+
+                        if (sessionResponse.ok) {
+                            const sessionData = await sessionResponse.json();
+
+                            // débug
+                            console.log("sessionData:\n", sessionData)
+
+                            setUser(sessionData as AuthUser);
+                        }
                     }
                 } else {
 
@@ -166,7 +253,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                     const accessToken = await tokenResponse.json()
                     
                     // débug
-                    console.log("access token:\n", accessToken)
+                    console.log("access token:\n", accessToken);
+                    console.log("access token (stringified):", JSON.stringify(accessToken))
 
                     setAccessToken(JSON.stringify(accessToken));
 
@@ -184,13 +272,6 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
                     // débug
                     console.log("decoded jwt:", decodedJwt)
-
-                    // mettre l'utiliseur en tant que random pour le moment
-                    // const connectedUser = {
-                    //     id: "random",
-                    //     email: "random email",
-                    //     name: "beto ramos",
-                    // } as AuthUser;
 
                     setUser(decodedJwt as AuthUser);
                 }
@@ -222,9 +303,81 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         }
     };
 
-    const signOut = async () => {};
+    // déconnecter l'utilisateur
+    const signOut = async () => {
+        if (isWeb) {
+            // Client Web: Appeler l'endpoint signout pour retirer le cookie
+            try {
+                await fetch(`${BACKEND_BASE_URL}/auth/signout`, {
+                    method: "POST",
+                    credentials: "include",
+                });
+            } catch (e) {
+                console.log("erreur lors de la déconnexion côté serveur:", e);
+            }
+        } else {
+            // Client natif: Retirer les tokens d'autorisation du cache
+            // 
+            // (dans notre cas uniquement l'access token)    
+            await tokenCache?.deleteToken(`${ACCESS_TOKEN_NAME}`)
+        }
 
-    const fetchWithAuth = async (url: string, options?: RequestInit) => {};
+        // modifier les états
+        setUser(null);
+        setAccessToken("");
+    };
+
+    // fetchWithAuth de récupérer des données protégées de notre backend
+    const fetchWithAuth = async (url: string, options: RequestInit) => {
+
+        // débug
+        console.log("demande de fetch avec les données d'authentification")
+        console.log("url:", url)
+
+        if (isWeb) {
+            // pour le web: inclure les credentials pour envoyer nos cookies
+            const response = await fetch(url, {
+                ...options,
+                credentials: "include",
+            });
+
+            // si la réponse renvoie une erreur d'autorisation, essayer de
+            // rafraîchir notre token d'accès
+            if (response.status === 401) {
+                console.log("Erreur 401: Unauthorized. Rafraichissez votre token d'accès")
+
+                // Tentative de rafraîchissement de l'access token
+                // si nous possédons un refresh token
+
+                // retenter le fetch si nous avons reçu un nouvel
+                // access token
+            }
+
+            return response;
+        } else {
+            // débug
+            console.log("client sur plateforme native");
+            console.log("access token:\n", accessToken)
+            console.log("access token (parsé):\n", JSON.parse(accessToken!))
+
+            // Pour un client natif: inclure l'access token dans Authorization header
+            const response = await fetch(url, {
+                ...options,
+                headers: {
+                    ...options.headers,
+                    Authorization: `Bearer ${JSON.parse(accessToken!)}`,
+                },
+            });
+
+            // débug
+            console.log("réponse reçue:\n", response)
+
+            // traiter les réponses avec le status 401 en tentant de refraîchir
+            // l'accès token si nous avons un refresh token
+
+            return response;
+        }
+    };
 
     return (
         <AuthContext.Provider value={{

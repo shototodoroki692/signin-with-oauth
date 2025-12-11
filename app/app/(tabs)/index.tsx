@@ -10,28 +10,25 @@ import { ThemedView } from '@/components/themed-view';
 import { Link } from 'expo-router';
 import MessageContainer from '@/components/customs/message-container';
 import { useEffect, useState } from 'react';
-import * as Constants from "@/constants"
+import {LAN_BACKEND_IP_ADDR, BACKEND_BASE_URL} from "@/constants"
 import { useAuth } from '@/context/auth';
 import LoginForm from '@/components/customs/login-form';
 
 // débug
-console.log("LAN_BACKEND_IP_ADDR:", Constants.LAN_BACKEND_IP_ADDR);
-console.log("BACKEND_DOMAIN_NAME:", Constants.BACKEND_BASE_URL);
+console.log("LAN_BACKEND_IP_ADDR:", LAN_BACKEND_IP_ADDR);
+console.log("BACKEND_DOMAIN_NAME:", BACKEND_BASE_URL);
 
 export default function HomeScreen() {
   // importer les éléments du contexte d'authentification
-  const { user, signOut, isLoading } = useAuth();
-
-  // état du chargement de la page
+  const { user, signOut, isLoading, fetchWithAuth } = useAuth();
   const [isPageLoading, setPageLoading] = useState<boolean>(false);
-
-  // état du serveur API
   const [isBackendAvailable, setBackendAvailable] = useState<boolean>(false);
+  const [data, setData] = useState(null);
 
   // test d'accès au backend
   async function getBackendPublicEndpoint() {
     try {
-      const response = await fetch(Constants.BACKEND_BASE_URL)
+      const response = await fetch(BACKEND_BASE_URL)
       response.status === 200 ? setBackendAvailable(true) : setBackendAvailable(false);
 
       // débug
@@ -45,6 +42,24 @@ export default function HomeScreen() {
     } finally {
       setPageLoading(false);
     }
+  }
+
+  // fonction de récupération des données protégées par notre authMiddleware
+  // dans notre backend
+  async function getProtectedData() {
+
+    // débug
+    console.log("demande d'accès aux données protégées");
+    
+    const response = await fetchWithAuth(`${BACKEND_BASE_URL}/protected/data`, {
+      method: "GET",
+    });
+
+    // débug
+    console.log("réponse renvoyée par le endpoint protégé:\n", response)
+
+    const data = await response.json();
+    setData(data);
   }
 
   // test du serveur API
@@ -91,8 +106,21 @@ export default function HomeScreen() {
           <Text style={styles.text}>Pseudo: {user?.name}</Text>
           <Text style={styles.text}>Email: {user?.email}</Text>
 
+          {/* Bouton pour récupérer des données protégées par notre authMiddleware */}
+          <Button title="Récupérer les données protégées" onPress={getProtectedData}></Button>
+
+          {/* Données protégées */}
+          {data ? 
+            <>
+              <Text style={styles.text1}>Données protégées:</Text>
+              <Text style={styles.text}>{JSON.stringify(data)}</Text>
+            </>
+            :
+            <></>
+          }
+
           {/* Bouton de déconnexion */}
-          <Button title="Se déconnecter" onPress={() => signOut()} /> 
+          <Button title="Se déconnecter" onPress={signOut} /> 
         </>
       : 
         // Formulaire de connexion

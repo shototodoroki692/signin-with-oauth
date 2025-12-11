@@ -45,7 +45,7 @@ func generateAccessToken(userData idTokenClaims) (*string,error) {
 	fmt.Println("demande de génération d'un token d'accès")
 
 	// générer la date d'expiration de l'acces token
-	expirationDate, err := generateExpirationDate()
+	expirationDate, err := generateExpirationDate(os.Getenv("ACCESS_TOKEN_LIFETIME"))
 	if err != nil {
 		return nil, err
 	}
@@ -103,10 +103,39 @@ func getIdTokenClaims(tokenStr string) (*idTokenClaims, error) {
 	return claims, nil
 }
 
-// generateExpirationDate permet de générer la date d'expiration de l'acces token
-func generateExpirationDate() (*time.Time, error) {
+// getVerifiedAccessToken permet d'obtenir les claims du token d'accès
+// seulement s'il n'a pas été falsifié.
+//
+// La fonction renvoi un pointeur nil sur un les claims du token d'accès 
+// seulement si l'erreur renvoyée n'est pas nulle
+func getVerifiedAccessToken(accessTokenStr string) (*accessTokenClaims, error) {
 
-	lifetimeStr := os.Getenv("ACCESS_TOKEN_LIFETIME")
+	accessTokenSecret := os.Getenv("ACCESS_TOKEN_SECRET")
+
+	// renvoyer le l'access token parsé, validé et vérifié
+	token, err := jwt.ParseWithClaims(accessTokenStr, &accessTokenClaims{}, func(token *jwt.Token) (any, error) {
+		return []byte(accessTokenSecret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+
+	if err != nil {
+		return nil, err
+	}
+
+	claims, ok := token.Claims.(*accessTokenClaims)
+	if !ok {
+		return nil, fmt.Errorf("le type de claims n'est pas reconnu")
+	}
+
+	return claims, nil
+}
+
+// generateExpirationDate permet de générer une date d'expiration au format
+// time.Time en prenant en paramètre une durée de vie en secondes (au format
+// string).
+//
+// La fonction renvoie un pointeur nil sur la date d'expiration seulement si
+// l'erreur renvoyée n'est pas nil
+func generateExpirationDate(lifetimeStr string) (*time.Time, error) {
 
 	lifetime, err := convertSecondsStrToDuration(lifetimeStr)
 	if err != nil {

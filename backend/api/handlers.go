@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // tokenRequest définit le format du corps des requêtes de demandes
@@ -162,19 +163,6 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		return respondWithError(w, http.StatusBadRequest, errorMessage)
 	}
 
-	// débug
-	// fmt.Printf("corps de la requête: %q\ntype de la requête: %T\n", r.Body, r.Body)
-	// bodyBytes, err := io.ReadAll(r.Body)
-	// if err != nil {
-	// 	log.Println("impossible de lire le corps de la requête:\n", err)
-	// 	return err
-	// }
-
-	// r.Body.Close()
-
-	// fmt.Printf("coprs de la requête reçu:\n%s\n", bodyBytes)
-	// fin du débug
-
 	// récupération des champs du formulaire contenus dans le corps de la requête
 	requestBody := &tokenRequestBody{
 		r.FormValue("grant_type"),
@@ -183,9 +171,6 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		r.FormValue("redirect_uri"),
 		r.FormValue("code"),
 	}
-
-	// débug
-	fmt.Println("corps de la requête:\n", requestBody)
 
 	if requestBody.Code == "" {
 		return respondWithError(w, http.StatusBadRequest, "aucun code d'autorisation fournit")
@@ -205,9 +190,6 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 	googleRequestEncodedPayload := googleRequestPayload.Encode()
 	googleRequestBody := strings.NewReader(googleRequestEncodedPayload)
 
-	// débug
-	fmt.Println("\ncorps de la requête envoyée à Google:\n", googleRequestBody)
-
 	// envoyer la requête d'obtention de l'id token à Google
 	response, err := http.Post(googleRequestURL, googleRequestContentType, googleRequestBody)
 	if err != nil {
@@ -215,19 +197,7 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	// débug
-	// fmt.Printf("\nréponse reçue de Google:\n%v\n", *response)
-	// bodyBytes, err := io.ReadAll(response.Body)
-	// if err != nil {
-	// 	return err
-	// }
-	// fmt.Printf("\ncorps de la réponse:\n%v\n", string(bodyBytes))
-	// fin du débug
-
-	// récupérer la réponse au formar json
-	// var responseBodyBuffer bytes.Buffer
-	// var responseBodyAny any
-	responseBody := struct {
+	googleResponseBody := struct {
 		AccessToken	string	`json:"access_token"`
 		ExpiresIn	int		`json:"expires_in"`
 		Scope		string	`json:"scope"`
@@ -241,59 +211,201 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 	}
 	response.Body.Close()
 
-	responseBodyBuf := bytes.NewBuffer(responseBodyBytes)
-	
-	// débug
-	fmt.Printf("\nréponse renvoyée par Google (buffer):\n%v\n", responseBodyBuf)
-
-	// récupérer l'id token renvoyé par Google
-	// if err := json.NewDecoder(responseBodyBuf).Decode(&responseBody); err != nil {
-	// 	log.Println("erreur de récupération du corps de la réponse:\n", err)
-	// 	return err
-	// }
-
-	if err := json.Unmarshal(responseBodyBytes, &responseBody); err != nil {
+	if err := json.Unmarshal(responseBodyBytes, &googleResponseBody); err != nil {
 		log.Println("erreur de conversion du corps de la réponse au format json:\n", err)
 		return err
 	}
 
-	// débug
-	fmt.Printf("\nréponse reçue:\n%v\n", responseBody)
-
-	if responseBody.IdToken == "" {
+	if googleResponseBody.IdToken == "" {
 		return respondWithError(w, http.StatusBadRequest, "Aucun Id token reçu de Google")
 	}
 
-	// débug
-	// fmt.Println("réponse renvoyée par Google:\n", responseBody)
-	fmt.Println("id token renvoyé:\n", responseBody.IdToken)
-
 	// récupérer les informations contenues dans l'id token
-	data, err := getIdTokenClaims(responseBody.IdToken)
+	data, err := getIdTokenClaims(googleResponseBody.IdToken)
 	if err != nil {
 		return err
 	}
-
-	// TODO:
-	// Stocker les données renvoyées dans l'id token dans notre base de données
-
-	// NOTE:
-	// Lui il renvoie toutes les infos avec la librairie jose
 
 	accessToken, err := generateAccessToken(*data)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("\naccess token généré:\n", *accessToken)
-
 	// Si besoin générer le refresh token ici
 
 	// si le client est sur le web, stocker le token d'accès dans les cookies
 	if requestBody.Platform == "web" {
-		fmt.Println("TODO: traiter la réponse pour un client web")
+
+		// générer la date d'expiration du cookie
+		expiresAt, err := generateExpirationDate(os.Getenv("COOKIE_LIFETIME"))
+		if err != nil {
+			return err
+		}
+
+		maxAge, err := strconv.Atoi(os.Getenv("COOKIE_LIFETIME"))
+		if err != nil {
+			return err
+		}
+
+		// générer le corps de la réponse renvoyée
+		responseData := struct{
+			Success		bool		`json:"success"`
+			IssuedAt	time.Time	`json:"issued_at"`
+			ExpiresAt	time.Time	`json:"expires_at"`
+		}{
+			true,
+			time.Now().UTC(),
+			*expiresAt,
+		}
+
+		// définir le cookie que nous renvoyons au client
+		cookie := http.Cookie{
+			Name:			"access_token",
+			Value:			*accessToken,
+			Quoted:			true,
+
+			Path:			"/",
+			Expires:		*expiresAt,
+
+			MaxAge:			maxAge,
+			Secure:			true,
+			HttpOnly:		true,
+			// SameSite:		http.S,
+			Partitioned:	false,
+			Raw:			"jsais_pas",
+			Unparsed:		[]string{"random"},
+		}
+
+		// ajouter notre cookie au header de la réponse
+		http.SetCookie(w, &cookie)
+
+		// débug
+		responseBytes, err := json.Marshal(responseData)
+		if err != nil {
+			return err
+		}
+		fmt.Println("réponse renvoyée au client web:\n", string(responseBytes))
+		// fin du débug
+
+		return respondWithJSON(w, http.StatusOK, responseData)
 	}
 
 	// renvoyer notre token d'accès au client
 	return respondWithJSON(w, http.StatusOK, *accessToken)
+}
+
+// handleSession permet de récupérer les informations de la session de l'utilisateur
+//
+// NOTE: ce endpoint n'est utilisé que pour les clients web
+func (s *APIServer) handleSession(w http.ResponseWriter, r *http.Request) error {
+
+	fmt.Println("endpoint /auth/session atteint !")
+	
+	// vérifier qu'il s'agit bien d'une requête GET
+	if r.Method != "GET" {
+		return respondWithError(w, http.StatusBadRequest, "mauvaise méthode utilisée")
+	}
+
+	// obtenir le cookie depuis la réponse
+	cookie, err := r.Cookie("access_token")
+	if err != nil {
+		log.Println("erreur de récupération du cookie de session:\n", err)
+		return err
+	}
+
+	// récupérer l'access token stocké dans le cookie
+	accessToken := cookie.Value
+
+	// vérifier l'access token et en récupérer les claims s'il est authentique
+	claims, err := getVerifiedAccessToken(accessToken)	
+	if err != nil {
+		log.Println("erreur de vérification du token d'accès:\n", err)
+		return err
+	}
+
+	// générer la corps de la réponse
+	responseData :=  struct {
+		User				accessTokenClaims
+		CookieExpiration	time.Time
+	} {
+		*claims,
+		cookie.Expires,
+	}
+
+	return respondWithJSON(w, http.StatusOK, responseData)
+}
+
+// handleSignout permet de déconnecter un utilisateur
+//
+// NOTE: cette méthode n'est utile que pour les clients web, car nous supprimons
+// leur cookie d'accès. Le traitement de la déconnexion pour un client natif se
+// fait ici uniquement côté client
+func (s *APIServer) handleSignout(w http.ResponseWriter, r *http.Request) error {
+
+	fmt.Println(" endpoint /auth/signout atteint !")
+
+	if r.Method != "POST" {
+		return respondWithError(w, http.StatusMethodNotAllowed, "méthode non autorisée")
+	}
+
+	// créer le cookie
+	cookie := http.Cookie{
+		Name:			"access_token",
+		Value:			"",
+		Quoted:			true,
+
+		Path:			"/",
+		Expires:		time.Now().UTC(),
+
+		MaxAge:			0, // supprime le cookie instantanément
+		Secure:			true,
+		HttpOnly:		true,
+		// SameSite:		http.S,
+		// Partitioned:	false,
+		// Raw:			"jsais_pas",
+		// Unparsed:		[]string{"random"},
+	}
+
+	// retirer le cookie d'accès
+	//
+	// Vérifier que cette méthode de suppression du cookie est valide lorsque le
+	// client web fonctionnera correctement (actuellement blocké par les CORS policy)
+	http.SetCookie(w, &cookie)
+
+	// supprimer le refresh token des cookies si nous en avons un
+
+	return respondWithJSON(w, http.StatusOK, APIMessage{"signed-out"})
+}
+
+// handleData permet de récupérer des données protégées côté client
+//
+// Ce handler est protégé par un middleware qui vérifie que l'utilisateur est
+// correctement authentifié
+func (s *APIServer) handleData(w http.ResponseWriter, r *http.Request) error {
+
+	fmt.Println("endpoint /protected/data atteint !")
+
+	if r.Method != "GET" {
+		return respondWithError(w, http.StatusMethodNotAllowed, "methode non autorisée")
+	}
+
+	// récupérer le contexte
+	ctx := r.Context()
+	claims := ctx.Value("user").(*accessTokenClaims)
+
+	// préparer la réponse
+	response := struct {
+		PrivateMessage	string		`json:"private_message"`
+		UserEmail		string		`json:"user_email"`
+		UserName		string  	`json:"username"`
+		Date			time.Time	`json:"date"`
+	} {
+		"Ceci est un message privé, ne le répète à personne",
+		claims.Name,
+		claims.Email,
+		time.Now(),
+	}
+
+	// renvoyer la réponse
+	return respondWithJSON(w, http.StatusOK, response)
 }
