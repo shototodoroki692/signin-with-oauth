@@ -4,46 +4,21 @@
 
 import { useAuth } from "@/context/auth";
 import { View, Text, Button, StyleSheet } from "react-native";
-import * as AppleAuthentication from 'expo-apple-authentication'
+import { SignInWithAppleButton } from "./signin-with-apple-button";
+import SignInWithGoogleButton from "./signin-with-google-button";
 
 export default function LoginForm() {
     // importer les méthodes du hook d'authentification
-    const { signIn } = useAuth();
+    const { signIn, isLoading } = useAuth();
 
     return (
         <View style={styles.signInView}>
-            <Text style={styles.text}>Se connecter</Text>
 
             {/* Bouton de connexion avec Google */}
-            <Button title="Se connecter avec Google" onPress={signIn} />
+            <SignInWithGoogleButton onPress={signIn} disabled={isLoading} />
             
             {/* Bouton de connexion avec Apple */}
-            <View style={styles.container}>
-              <AppleAuthentication.AppleAuthenticationButton
-                buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN} 
-                buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.WHITE}
-                cornerRadius={5}
-                style={styles.button}
-                onPress={async () => {
-                  try {
-                    const credential = await AppleAuthentication.signInAsync({
-                      requestedScopes: [
-                        AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
-                        AppleAuthentication.AppleAuthenticationScope.EMAIL,
-                      ],
-                    });
-                    // signed in
-
-                    // débug
-                    console.log("credentials récupérés:\n", credential)
-
-                  } catch (e) {
-                    // débug
-                    console.log("erreur survenue lors de l'authentification avec apple")
-                  }
-                }}
-              />
-            </View>
+            <SignInWithAppleButton />
         </View>
     );
 }
@@ -61,6 +36,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     height: 50,
     width: '100%',
+    backgroundColor: "#ae3f4e"
   },
   text: {
     color: "#ffffff"

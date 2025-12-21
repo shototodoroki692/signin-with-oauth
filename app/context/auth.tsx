@@ -14,6 +14,8 @@ import {
     makeRedirectUri, 
     useAuthRequest 
 } from "expo-auth-session";
+import * as AppleAuthentication from "expo-apple-authentication";
+import { randomUUID } from "expo-crypto"
 import { ACCESS_TOKEN_NAME, BACKEND_BASE_URL } from "@/constants";
 import { Platform } from "react-native";
 import { tokenCache } from "@/utils/cache";
@@ -39,6 +41,8 @@ const AuthContext = React.createContext({
     user: null as AuthUser | null,
     signIn: () => {},
     signOut: () => {},
+    signInWithApple: () => {},
+    signInWithAppleWebBrowser: () => {},
     fetchWithAuth: (url: string, options: RequestInit) => Promise.resolve(new Response()),
     isLoading: false,
     error: null as AuthError | null,
@@ -82,6 +86,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     const [request, response, promptAsync] = useAuthRequest(config, discovery);
     const isWeb = Platform.OS === "web";
 
+    // traitement de la réponse reçue après l'appel de promptAsync dans signIn
     React.useEffect(() => {
         // débug
         console.log("réponse reçue de la requête d'authentification:\n", response)
@@ -303,6 +308,108 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         }
     };
 
+    // signInWithApple permet de s'authentifier avec son compte Apple lorsque 
+    // l'utilisateur est sur un client ios
+    const signInWithApple = async () => {
+
+        // débug
+        console.log("tentative de connexion avevc Apple depuis un appareil ios");
+
+        try {
+            const rawNonce = randomUUID();
+
+            // renvoi les informations de l'utiliseur
+            const credential = await AppleAuthentication.signInAsync({
+                requestedScopes: [
+                AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+                AppleAuthentication.AppleAuthenticationScope.EMAIL,
+                ],
+                nonce: rawNonce,
+            });
+            // signed in
+
+            // débug
+            console.log("credentials récupérés:\n", credential)
+
+            if (credential.fullName?.givenName && credential.email) {
+                // Ces informations indiquent qu'il s'agit de la première
+                // connexion de l'utilisateur avec Apple.
+                // Il s'agit de notre seule chance d'obtenir le nom et l'email
+                // de l'utilisateur.
+                // Nous devons stocker ces informations dans notre base de données
+                // Nous pouvons également traiter cela côté serveur. Il faut juste 
+                // garder en tête qu'Apple fournit le nom et l'email de l'utilisateur
+                // uniquement à la première connexion de ce dernier. Ces champs seront
+                // null lors des prochaines connexions de l'utilisateur avec Apple.
+                console.log("Première connexion de l'utilisateur avec Apple");
+            }
+
+            // envoyer l'identity token et le code d'autorisation à notre backend
+            const appleResponse = await fetch(`${BACKEND_BASE_URL}/auth/apple/ios`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    identiyToken: credential.identityToken,
+                    rawNonce, // Utiliser le nonce que nous avons généré et transmis à Apple
+
+                    // IMPORTANT:
+                    // Apple fournit uniquement le nom et l'email lors de la première connexion.
+                    // Lors des connexions suivantes, ces champs seront null.
+                    // Nous devons stocker les informations de l'utilisateur fournies lors de sa
+                    // première connexion dans notre base de données, et récupérer ces informations
+                    // lors des prochaines connexions en utilisant l'identifiant utilisateur stable
+                    givenName: credential.fullName?.givenName,
+                    familyName: credential.fullName?.familyName,
+                    email: credential.email,
+                }),
+            });
+
+            // si appleResponse est ok, stocker les tokens d'accès dans le local storage
+            const tokens = await appleResponse.json();
+            await handleNativeTokens(tokens);
+
+        } catch (e) {
+            // débug
+            console.log("erreur survenue lors de l'authentification avec apple");
+        }
+    };
+
+    // handleNativeTokens permet de traiter la réception des tokens d'autorisation
+    // renvoyés par notre backend après l'authentification de l'utilisateur avec Apple
+    const handleNativeTokens = async (tokens: {
+        accessToken: string;
+        refreshToken: string;
+    }) => {
+        const { accessToken: newAccessToken, refreshToken: newRefreshToken } = tokens;
+
+        console.log("access token initial reçu:", newAccessToken ? "présent" : "manquant");
+        console.log("refresh token initial reçu:", newRefreshToken ? "présent" : "manquant");
+
+        // stocker les tokens dans les états
+        if (newAccessToken) setAccessToken(newAccessToken);
+        // if (newRefreshToken) setRefreshToken(newRefreshToken); // à ajouter lorsque nous utiliserons un refresh token
+    
+        // Stocker les tokens dans le secure storage
+        if (newAccessToken) 
+            await tokenCache?.saveToken("accessToken", newAccessToken);
+
+        // à ajouter lorsque nous utiliserons les refresh tokens
+        // if (newRefreshToken)
+        //     await tokenCache?.saveToken("refreshToken", newRefreshToken)
+
+        // décoder l'access token pour obtenir les informations de l'utilisateur
+        if (newAccessToken) {
+            const decodedAccessToken = jose.decodeJwt(newAccessToken);
+            setUser(decodedAccessToken as AuthUser);
+        }
+    }
+
+    // signInWithAppleWebBrowser permet de s'authentifier avec son compte Apple
+    // lorsque l'utilisateur est sur un client web ou android
+    const signInWithAppleWebBrowser = async () => {}
+
     // déconnecter l'utilisateur
     const signOut = async () => {
         if (isWeb) {
@@ -384,6 +491,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             user,
             signIn,
             signOut,
+            signInWithApple,
             fetchWithAuth,
             isLoading,
             error,

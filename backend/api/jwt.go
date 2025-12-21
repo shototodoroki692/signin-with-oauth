@@ -39,7 +39,7 @@ type idTokenClaims struct {
 //
 // Un pointeur nil sur le token de d'accès est renvoyé uniquement si l'erreur
 // renvoyée n'est pas nil
-func generateAccessToken(userData idTokenClaims) (*string,error) {
+func generateAccessToken(email, name string, emailVerified bool) (*string, error) {
 
 	// débug
 	fmt.Println("demande de génération d'un token d'accès")
@@ -53,9 +53,9 @@ func generateAccessToken(userData idTokenClaims) (*string,error) {
 	// définir le payload du token d'accès
 	claims := accessTokenClaims{
 		"user_id_backend_defined",
-		userData.Email,
-		userData.EmailVerified,
-		userData.Name,
+		email,
+		emailVerified,
+		name,
 		jwt.RegisteredClaims {
 			Issuer:		"signin-with-oauth",
 			IssuedAt:	jwt.NewNumericDate(time.Now().UTC()),

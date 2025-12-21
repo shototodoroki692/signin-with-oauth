@@ -1,17 +1,25 @@
 package api
 
 import (
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
+
+// HANDLERS
 
 // tokenRequest définit le format du corps des requêtes de demandes
 // de tokens d'autorisation
@@ -53,7 +61,7 @@ func (s *APIServer) handleAuthorize(w http.ResponseWriter, r *http.Request) erro
 	internalClient := requestQuery.Get("client_id")
 	redirectUri := requestQuery.Get("redirect_uri")
 
-	// Plateforme depuis laquelle s'authentifie l'utilisateur
+	// plateforme depuis laquelle s'authentifie l'utilisateur
 	var plateform string
 
 	// définir la plateforme utilisée par l'utilisateur selon redirectUri
@@ -226,7 +234,7 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	accessToken, err := generateAccessToken(*data)
+	accessToken, err := generateAccessToken(data.GivenName, data.Email, data.EmailVerified)
 	if err != nil {
 		return err
 	}
@@ -278,14 +286,6 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 
 		// ajouter notre cookie au header de la réponse
 		http.SetCookie(w, &cookie)
-
-		// débug
-		responseBytes, err := json.Marshal(responseData)
-		if err != nil {
-			return err
-		}
-		fmt.Println("réponse renvoyée au client web:\n", string(responseBytes))
-		// fin du débug
 
 		return respondWithJSON(w, http.StatusOK, responseData)
 	}
@@ -391,7 +391,12 @@ func (s *APIServer) handleData(w http.ResponseWriter, r *http.Request) error {
 
 	// récupérer le contexte
 	ctx := r.Context()
-	claims := ctx.Value("user").(*accessTokenClaims)
+	claims, ok := ctx.Value("user").(*accessTokenClaims)
+
+	if !ok {
+		log.Println("les claims récupérés dans le contexte ne sont pas de la forme *accessTokenClaims")
+		respondWithError(w, http.StatusInternalServerError, "internal-server-error")
+	}
 
 	// préparer la réponse
 	response := struct {
@@ -408,4 +413,274 @@ func (s *APIServer) handleData(w http.ResponseWriter, r *http.Request) error {
 
 	// renvoyer la réponse
 	return respondWithJSON(w, http.StatusOK, response)
+}
+
+// appleAuthRequest définit le contenu du corps d'une requête d'authentification
+// avec Apple
+type appleAuthRequest struct {
+	IdentityToken	string	`json:"id_token"`
+	RawNonce		string	`json:"raw_nonce"`
+	GivenName		*string	`json:"given_name,omitempty"`
+	FamilyName		*string	`json:"family_name,omitempty"`
+	Email			*string	`json:"email,omitempty"`
+}
+
+// appleIdTokenClaims définit les claims que contient l'identity token fournit par
+// Apple pour identifier un utilisateur authentifié avec Apple
+type appleIdTokenClaims struct {
+	Nonce			string	`json:"nonce"`
+	CHash			string	`json:"c_hash"`
+	Email			string	`json:"email"`
+	EmailVerified	bool	`json:"email_verified"`
+	IsPrivateEmail	bool	`json:"is_private_email"`	
+	jwt.RegisteredClaims
+}
+
+// handleAppleIOS permet de traiter les demandes d'authentification d'un 
+// utilisateur avec son compte Apple depuis un client IOS
+func (s *APIServer) handleAppleIOS(w http.ResponseWriter, r *http.Request) error {
+	
+	fmt.Println("endpoint /auth/apple/ios atteint !")
+
+	if r.Method != "POST" {
+		return respondWithError(w, http.StatusMethodNotAllowed, "méthode non autorisée")
+	}
+
+	var requestBodyAny any
+	
+	// récupérer le corps de la requête au format json décodé
+	if err := json.NewDecoder(r.Body).Decode(&requestBodyAny); err != nil {
+		return respondWithError(w, http.StatusBadRequest, "mauvaise requête")
+	}
+
+	// débug
+	requestBodyStr, err := readableJSON(requestBodyAny)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("corps de la requête envoyée pour l'authentification avec Apple:\n", requestBodyStr)
+	// fin du débug
+
+	requestBody, ok := requestBodyAny.(appleAuthRequest)
+	if !ok {
+		log.Println("le corps de la requête ne correspond pas au format appleAuthRequest")
+		return respondWithError(w, http.StatusBadRequest, "mauvaise requête")
+	}
+
+	// ATTENTION:
+	// Il faut vérifier auprès d'apple que les données fournies par le client sont valides
+	// avant de renvoyer notre accès token.
+	// 
+	// TODO: 
+	// Implémenter la logique de vérification par Apple des données reçues
+
+	// générer un token d'accès pour l'utilisateur
+	accessToken, err := generateAccessToken(*requestBody.GivenName, *requestBody.Email, true)
+	if err != nil {
+		return err
+	}
+
+	// créer le corps de la réponse renvoyée à l'utilisateur
+	responseBody := struct {
+		AccessToken	string	`json:"access_token"`
+	} {
+		*accessToken,
+	}
+
+	// renvoyer la réponse
+	return respondWithJSON(w, http.StatusOK, responseBody)
+}
+
+// verifyAndCreateAccessToken permet de vérifier les informations fournies par le client
+// lors d'une demande d'authentification avec Apple, et renvoi un access token si les
+// informations sont correctes
+//
+// NOTE:
+// Afin de vérifier l'identity token reçu du client nous devons:
+// 1. Vérifier la signature JWS E256 en utilisant la clé publique de notre serveur
+// 2. Vérifier le nonce utilisé pour l'authentification
+// 3. Vérifier que le champs contient https://appleid.apple.com
+// 4. Vérifier que le champs "aud" correspond à notre client_id de développeur
+// 5. Vérifier que la date d'expiration du token "exp" n'est pas dépassée
+//
+// voir https://developer.apple.com/documentation/signinwithapple/verifying-a-user
+func verifyAndCreateAccessToken(data appleAuthRequest) (*string, error) {
+
+	// vérifier s'il s'agit de la première demande d'authentification avec Apple
+	isFirstSigninWithApple := false
+	if data.Email != nil && data.GivenName != nil {
+		isFirstSigninWithApple = true
+	} 
+
+	fmt.Println(isFirstSigninWithApple)
+
+	// 1. Vérifier la signature JWS E256 en utilisant la clé publique de notre serveur
+	// // vérifier la signature du de l'identity token
+	// idToken, ok := getValidatedAppleIdToken(data.IdentityToken)
+
+	// 2. Vérifier le nonce utilisé pour l'authentification
+	// 3. Vérifier que le champs contient https://appleid.apple.com
+	// 4. Vérifier que le champs "aud" correspond à notre client_id de développeur
+	// 5. Vérifier que la date d'expiration du token "exp" n'est pas dépassée
+
+	return nil, nil
+}
+
+// appleJWK (JSON Web Key) représente une clé publique utilisée pour vérifier les
+// identity tokens délivrés par Apple
+type appleJWK struct {
+	Alg	string	`json:"alg"`	// algorithme utilisé pour encrypter le token
+	E	string	`json:"e"`		// valeur de l'exposant pour la clé publique RSA
+	Kid	string	`json:"kid"`	// identifiant de la clé
+	Kty	string	`json:"kty"`	// paramétrage du type de clé (doit être "RSA")
+	N	string	`json:"n"`		// valeur de la clé publique RSA
+	Use	string	`json:"use"`	// l'utilisation attendue de la clé publique
+}
+
+// appleJWKSet (JSON Web Key Set) représente une liste d'objets JWK (JSON Web Key)
+type appleJWKSet struct {
+	Keys	[]appleJWK	`json:"keys"`
+}
+
+// getValidatedAppleIdToken permet d'obtenir l'identity token transmit par
+// Apple à l'utilisateur vérifié, au format *jwt.Token
+func getValidatedAppleIdToken(idTokenStr string) (*jwt.Token, error) {
+	
+	return jwt.ParseWithClaims(idTokenStr, &appleIdTokenClaims{}, func(token *jwt.Token) (any, error) {
+		return getAppleIdTokenPublicKey(token)
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
+}	
+
+// getAppleIdTokenPublicKey permet de récupérer la clé publique permettant de
+// valider la signature de l'identity token d'Apple.
+//
+// La fonction renvoie un pointeur sur la clé publique rsa si l'erreur renvoyée
+// est non-nil.
+func getAppleIdTokenPublicKey(idToken *jwt.Token) (*rsa.PublicKey, error) {
+
+	// récupérer le kid du token
+	kid, ok := idToken.Header["kid"]
+	if !ok {
+		return nil, errors.New("aucun kid trouvé dans le header de l'identity token d'Apple")
+	}
+
+	// convertir le kid au format string
+	kidStr, ok := kid.(string)
+	if !ok {
+		return nil, fmt.Errorf("impossible de convertir le kid suivant au format string: %s", kid)
+	}
+
+	// récupérer la clé publique de signature de l'idToken avec le kid
+	return getCorrespondingApplePublicKey(kidStr)
+}
+
+// getCorrespondingApplePublicKey permet d'obtenir la clé publique de signature de
+// l'identity token correspondant au kid que nous fournissons.
+//
+// La fonction renvoie un pointeur nil sur la clé publique rsa si l'erreur renvoyée
+// est non-nil.
+func getCorrespondingApplePublicKey(kid string) (*rsa.PublicKey, error) {
+	
+	// récupérer la liste de JWK d'Apple
+	JWKSet, err := getAppleJWKSet()
+	if err != nil {
+		return nil, err
+	}
+
+	// renvoyer la clé publique si l'une d'elle correspond à notre kid
+	for _, key := range JWKSet.Keys {
+		if key.Kid == kid {
+			
+			// créer une clé publique rsa.PublicKey d'après les données de la clé JWK
+			return jwkToRSAPublicKey(key)
+		}
+	}
+
+	// renvoyer une erreur si aucune clé publique ne correspond à notre kid
+	return nil, fmt.Errorf("aucune clé publique pour le kid: %s", kid)
+}
+
+// getAppleJWKSet permet de récupérer les clés JWK utilisées par Apple
+//
+// la fonction renvoi un JWKSet nil seulement si l'erreur renvoyée est
+// non nil
+func getAppleJWKSet() (*appleJWKSet, error) {
+	
+	// récupérer les clés publiques de signature des jwt Apple
+	res, err := http.Get("https://appleid.apple.com/auth/keys")
+	if err != nil {
+		log.Println("échec de la récupération du JWKSet d'Apple:\n", err)
+		return nil, err
+	}
+
+	JWKSet := new(appleJWKSet)
+
+	err = json.NewDecoder(res.Body).Decode(JWKSet)
+	if err != nil {
+		return nil, err
+	}
+
+	return JWKSet, nil
+}
+
+// jwkToRSAPublicKey permet de convertir une clé JWK au format rsa.PublicKey.
+//
+// La fonction renvoie un pointeur nil correspondant à la clé publique rsa
+// seulement si l'erreur renvoyée est non-nil.
+func jwkToRSAPublicKey(JWK appleJWK) (*rsa.PublicKey, error) {
+
+	decodedN, err := convertBase64urlUIntToBigInt(JWK.N)
+	if err != nil {
+		return nil, err
+	}
+
+	decodedE, err := convertBase64urlUIntToBigInt(JWK.E)
+	if err != nil {
+		return nil, err
+	}
+
+	rsaPublicKey := &rsa.PublicKey{
+		N:	decodedN,
+		E:	int(decodedE.Int64()),
+	}
+
+	return rsaPublicKey, nil
+}
+
+// convertBase64urlUIntToBigInt permet de récupérer l'entier correspondant au
+// paramètre de la clé publique rsa en encodé sous la forme de valeur Base64urlUInt
+//
+// La fonction renvoie un pointeur nil sur un big.Int seulement si l'erreur
+// renvoyée est non-nil
+func convertBase64urlUIntToBigInt(encodedStr string) (*big.Int, error) {
+
+	// décoder la chaîne de caractères encodée reçue 
+	buf, err := base64.RawURLEncoding.DecodeString(encodedStr)
+	if err != nil {
+		log.Println("erreur de décodage de la string encodée en base64urlUInt:\n", err)
+		return nil, err
+	}
+
+	// convertir le buffer contenant les informations décodées format []byte 
+	// au format big.Int.
+	decodedUInt := new(big.Int).SetBytes(buf)
+
+	return decodedUInt, nil
+}
+
+// UTILS
+
+// readableJSON permet de convertir un objet JSON en une chaîne de caractères lisible
+//
+// la fonction renvoie une string vide si l'erreur renvoyée est non nil
+func readableJSON(content any) (string, error) {
+
+	bytesData, err := json.Marshal(content)
+	if err != nil {
+		log.Println("erreur de récupération du json au format []bytes:\n", err)
+		return "", err
+	}
+
+	return string(bytesData), nil
 }

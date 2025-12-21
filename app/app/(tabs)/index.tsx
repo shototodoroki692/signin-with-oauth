@@ -89,7 +89,7 @@ export default function HomeScreen() {
 
       {/* titre de la page */}
       <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
+        <ThemedText type="title">Bienvenue!</ThemedText>
         <HelloWave />
       </ThemedView>
 

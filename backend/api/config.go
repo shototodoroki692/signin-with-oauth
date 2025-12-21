@@ -33,6 +33,7 @@ func (s *APIServer) Run() {
 	router.HandleFunc("/auth/token", makeErrorHandler(s.handleToken))
 	router.HandleFunc("/auth/session", makeErrorHandler(s.handleSession))
 	router.HandleFunc("/auth/signout", makeErrorHandler(s.handleSignout))
+	router.HandleFunc("/auth/apple/ios", makeErrorHandler(s.handleAppleIOS))
 	router.HandleFunc("/protected/data", s.authMiddleware(makeErrorHandler(s.handleData)))
 
 	// débug
