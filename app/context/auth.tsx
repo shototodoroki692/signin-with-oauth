@@ -48,9 +48,18 @@ const AuthContext = React.createContext({
     error: null as AuthError | null,
 });
 
+// configuration de la requête d'authentification avec Google
 const config: AuthRequestConfig = {
     clientId: "google",
     scopes: ["openid", "profile", "email"],
+    redirectUri: makeRedirectUri(),
+};
+
+// configuration de la requête d'authentification avec Apple (inutile
+// pour la configuration d'un client iOS seul)
+const appleConfig: AuthRequestConfig = {
+    clientId: "apple",
+    scopes: ["name", "email"],
     redirectUri: makeRedirectUri(),
 };
 
@@ -76,6 +85,13 @@ const discovery: DiscoveryDocument = {
     tokenEndpoint: `${BACKEND_BASE_URL}/auth/token`,
 };
 
+// discoveryDocument utilisé pour l'authentification avec Apple (inutile
+// pour la configuration d'un client iOS seul)
+const appleDiscovery: DiscoveryDocument = {
+    authorizationEndpoint: `${BACKEND_BASE_URL}/auth/apple/authorize`,
+    tokenEndpoint: `${BACKEND_BASE_URL}/auth/apple/token`,
+};
+
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
     const [user, setUser] = React.useState<AuthUser | null>(null);
@@ -83,16 +99,31 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     const [error, setError] = React.useState<AuthError | null>(null);
     const [accessToken, setAccessToken] = React.useState<string | null>(null);
 
+    // configuration de la requête d'authentification avec Apple (inutile
+    // lors de l'utilisation d'un client iOS seul)
+    const [appleRequest, appleResponse, promptAppleAsync] = useAuthRequest(appleConfig, appleDiscovery);
+
+    // configuration de la requête d'authentification avec Google
     const [request, response, promptAsync] = useAuthRequest(config, discovery);
+
     const isWeb = Platform.OS === "web";
 
     // traitement de la réponse reçue après l'appel de promptAsync dans signIn
     React.useEffect(() => {
         // débug
-        console.log("réponse reçue de la requête d'authentification:\n", response)
+        console.log("réponse reçue de la requête d'authentification avec Google:\n", response)
 
         handleResponse();
     }, [response]);
+
+    // traitement de la réponse reçue après l'appel de promptAppleAsync dans le
+    // signInWithApple.
+    React.useEffect(() => {
+        // débug
+        console.log("réponse reçue de la requête d'authentification avec Apple:\n", appleResponse)
+
+        handleAppleResponse();
+    }, [appleResponse]);
 
     // restaurer la session de l'utilisateur dès qu'il rafraîchit sa page web
     // Cela ne fonctionne que si le cookie est encore valide au moment du
@@ -291,6 +322,130 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         }
     }
 
+    // handleAppleResponse permet de traiter la réponse renvoyée suite à une demande d'authentification
+    // avec Apple (inutile pour un client iOS seul)
+    const handleAppleResponse = async () => {
+        if (appleResponse?.type === "success") {
+            try {
+                // // échanger le code d'autorisation Google avec les tokens d'autorisation de notre backend:
+                // //
+                // // La requête envoyée en fond atteindra notre endpoint /auth/token
+                // //
+                // // ATTENTION:
+                // // Le contenu du corps de la requête n'est pas du json mais x-www-form-urlencoded
+                // //
+                // // NOTE:
+                // // Il est possible d'effectuer la requête avec un fetch classique
+                // // envoyant le code d'autorisation Google dans le body. Mais ici 
+                // // nous utilisons déjà la bibliothèque expo-auth-session, donc nous
+                // // en utilisons les fonctions.
+                // //
+                // // Voici comment faire:
+
+                // // récupérer le code d'autorisation Google
+                // const { code } = response.params;
+
+                // // créer un formulaire de données pour envoyer à notre endpoint /auth/token
+                // const formData = new FormData();
+                // formData.append("code", code);
+
+                // // préciser au serveur si le client est un client web.
+                // // (par défaut, le serveur considère que le client est une plateform native)
+                // if (isWeb) {
+                //     formData.append("platform", "web")
+                // }
+
+                // // récupérer le code verifier de la requête
+                // // Il s'agit du même verifier que celui utilisé pour générer le challenge pour le code
+                // if (request?.codeVerifier) {
+                //     formData.append("code_verifier", request.codeVerifier);
+                // } else {
+                //     console.warn("aucun code verifier n'a été trouvé dans la requête")
+                // }
+
+                // // envoyer notre code d'autorisation à notre endpoint /auth/token
+                // // Le serveur va échanger ce code pour obtenir en retour les tokens d'autorisation
+                // // (access et refresh token) de notre serveur.
+                // //
+                // // NOTE:
+                // // client natif: les tokens sont contenus directement dans la réponse
+                // const tokenResponse = await fetch(`${BACKEND_BASE_URL}/auth/token`, {
+                //     method: "POST",
+                //     body: formData,
+                //     credentials: isWeb ? "include" : "same-origin",
+                // });
+
+                // Voici la manière d'envoyer la requête en utilisant la bibliothèque 
+                // expo-auth-session
+
+                const { code } = appleResponse.params;
+                
+                const response = await exchangeCodeAsync(
+                    {
+                        clientId: "apple",
+                        code,
+                        redirectUri: makeRedirectUri(),
+                        extraParams: {
+                            platform: Platform.OS,
+                        },
+                    },
+                    appleDiscovery
+                );
+
+                // débug
+                console.log("réponse de /auth/apple/callback:", response)
+
+                if (isWeb) {
+                    // Pour le web, le serveur met le token dans un cookie http-only
+                    // Nous avons juste à récupérer les données de l'utilisateur dans la reponse
+
+                    // débug
+                    console.log("demande des informations de session")
+
+                    // récupérer la session pour obtenir les données de l'utilisateur
+                    // Cela assure que nous avons les dernières informations mise à jour.
+                    const sessionResponse = await fetch(`${BACKEND_BASE_URL}/auth/session`, {
+                        method: "GET",
+                        credentials: "include",
+                    });
+
+                    // ATTENTION:
+                    // j'ai l'erreur suivante dans mon navigateur une fois le fetch
+                    // réalisé:
+                    // has been blocked by CORS policy: No 'Access-Control-Allow-Origin'
+                    //
+                    // Pour l'instant je ne m'en occupe pas car elle concerne les 
+                    // clients web uniquement 
+
+                    if (sessionResponse.ok) {
+                        const sessionData = await sessionResponse.json();
+
+                        // débug
+                        console.log("sessionData:\n", sessionData);
+
+                        setUser(sessionData as AuthUser);
+                    }
+                } else {
+                    // RAPPEL:
+                    // Ce bloc ne concerne que les clients android.
+                    // Le client iOS (l'autre type de client natif) étant traité dans
+                    // la fonction signInWithApple.
+                    await handleNativeTokens({
+                        accessToken: response.accessToken,
+                        refreshToken: "", // nous ne renvoyons pas de refresh token pour l'instant
+                    });
+                }
+            } catch(e) {
+                console.log("erreur:", e)
+            } finally {
+                setIsLoading(false);
+            }
+
+        } else if (response?.type === "error") {
+            setError(response.error as AuthError);
+        }
+    }
+
     // signIn permet d'envoyer une demande de connexion avec Google
     const signIn = async () => {
         // débug
@@ -351,8 +506,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
-                    identiyToken: credential.identityToken,
-                    rawNonce, // Utiliser le nonce que nous avons généré et transmis à Apple
+                    identity_token: credential.identityToken,
+                    raw_nonce: rawNonce, // Utiliser le nonce que nous avons généré et transmis à Apple
 
                     // IMPORTANT:
                     // Apple fournit uniquement le nom et l'email lors de la première connexion.
@@ -360,8 +515,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                     // Nous devons stocker les informations de l'utilisateur fournies lors de sa
                     // première connexion dans notre base de données, et récupérer ces informations
                     // lors des prochaines connexions en utilisant l'identifiant utilisateur stable
-                    givenName: credential.fullName?.givenName,
-                    familyName: credential.fullName?.familyName,
+                    given_name: credential.fullName?.givenName,
+                    family_name: credential.fullName?.familyName,
                     email: credential.email,
                 }),
             });
@@ -373,6 +528,20 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         } catch (e) {
             // débug
             console.log("erreur survenue lors de l'authentification avec apple");
+        }
+    };
+
+    // signInWithAppleWebBrowser permet de s'authentifier avec son compte Apple
+    // lorsque l'utilisateur est sur un client web ou android
+    const signInWithAppleWebBrowser = async () => {
+        try {
+            if (!appleRequest) {
+                console.log("appleRequest null");
+                return;
+            }
+            await promptAppleAsync();
+        } catch (e) {
+            console.log("erreur survenue lors de l'authentification avec Apple sur un client web:\n", e)
         }
     };
 
@@ -405,10 +574,6 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             setUser(decodedAccessToken as AuthUser);
         }
     }
-
-    // signInWithAppleWebBrowser permet de s'authentifier avec son compte Apple
-    // lorsque l'utilisateur est sur un client web ou android
-    const signInWithAppleWebBrowser = async () => {}
 
     // déconnecter l'utilisateur
     const signOut = async () => {
@@ -492,6 +657,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             signIn,
             signOut,
             signInWithApple,
+            signInWithAppleWebBrowser,
             fetchWithAuth,
             isLoading,
             error,

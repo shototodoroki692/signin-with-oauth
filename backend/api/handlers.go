@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,7 @@ import (
 
 // HANDLERS
 
-// tokenRequest définit le format du corps des requêtes de demandes
+// tokenRequestBody définit le format du corps des requêtes de demandes
 // de tokens d'autorisation
 type tokenRequestBody struct {
 	GrantType	string
@@ -56,6 +57,9 @@ func (s *APIServer) handleAuthorize(w http.ResponseWriter, r *http.Request) erro
 
 	requestURL := r.URL
 	requestQuery := requestURL.Query()
+
+	// débug
+	fmt.Println("requête d'autorisation envoyée par l'app:\n", requestURL)
 
 	var idpClientId string
 	internalClient := requestQuery.Get("client_id")
@@ -93,9 +97,13 @@ func (s *APIServer) handleAuthorize(w http.ResponseWriter, r *http.Request) erro
 	query.Set("scope", requestQuery.Get("scope")) // ou "identity" si pas de scope (identity permet juste de récupérer les informations de l'utilisateur)
 	query.Set("state", state) 
 	query.Set("prompt", "select_account") // indique que nous demandons à l'utilisateur de sélectionner son compte Google. Ce paramètre peut être ignoré si nous voulons directement sign-in l'utilisateur
+	query.Set("access_type", "offline") // permet d'obtenir un refresh token de la par de Google par la suite
 
 	encodedQuery := query.Encode()
 	redirectURL := fmt.Sprintf("%s?%s", os.Getenv("GOOGLE_AUTH_URL"), encodedQuery)
+
+	// débug
+	fmt.Printf("\nurl vers laquelle est redirigé le client:\n%s\n\n", redirectURL)
 
 	// renvoyer au client une redirection vers la page d'authentification Google
 	http.Redirect(w, r, redirectURL, http.StatusPermanentRedirect)
@@ -180,6 +188,11 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		r.FormValue("code"),
 	}
 
+	// débug
+	rb, _ := readableJSON(requestBody)
+	fmt.Printf("corps de la requête reçue:\n%s\n\n", rb)
+	// fin du débug
+
 	if requestBody.Code == "" {
 		return respondWithError(w, http.StatusBadRequest, "aucun code d'autorisation fournit")
 	}
@@ -206,11 +219,13 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	googleResponseBody := struct {
-		AccessToken	string	`json:"access_token"`
-		ExpiresIn	int		`json:"expires_in"`
-		Scope		string	`json:"scope"`
-		TokenType	string	`json:"token_type"`
-		IdToken		string	`json:"id_token"`
+		AccessToken				string	`json:"access_token"`
+		ExpiresIn				int		`json:"expires_in"`
+		RefreshToken			string	`json:"refresh_token"`
+		RefreshTokenExpiresIn	int		`json:"refresh_token_expires_in"`
+		Scope					string	`json:"scope"`
+		TokenType				string	`json:"token_type"`
+		IdToken					string	`json:"id_token"`
 	} {}
 
 	responseBodyBytes, err := io.ReadAll(response.Body)
@@ -218,6 +233,9 @@ func (s *APIServer) handleToken(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	response.Body.Close()
+
+	// débug
+	fmt.Println("réponse à notre demande de tokens à Google:\n", string(responseBodyBytes))
 
 	if err := json.Unmarshal(responseBodyBytes, &googleResponseBody); err != nil {
 		log.Println("erreur de conversion du corps de la réponse au format json:\n", err)
@@ -428,12 +446,26 @@ type appleAuthRequest struct {
 // appleIdTokenClaims définit les claims que contient l'identity token fournit par
 // Apple pour identifier un utilisateur authentifié avec Apple
 type appleIdTokenClaims struct {
-	Nonce			string	`json:"nonce"`
-	CHash			string	`json:"c_hash"`
-	Email			string	`json:"email"`
-	EmailVerified	bool	`json:"email_verified"`
-	IsPrivateEmail	bool	`json:"is_private_email"`	
+	Nonce			string			`json:"nonce"`				// ATTENTION: champs présent uniquement si le client passe un nonce dans la requête d'autorisation à Apple
+	CHash			string			`json:"c_hash"`
+	Email			string			`json:"email"`
+	EmailVerified	bool			`json:"email_verified"`
+	IsPrivateEmail	bool			`json:"is_private_email"`	
+	AuthTime		jwt.NumericDate	`json:"auth_time"`
+	NonceSupported	bool			`json:"nonce_supported"`
 	jwt.RegisteredClaims
+}
+
+// Valide permet de d'ajouter des conditions de validations supplémentaires pour
+// les claims des identity tokens d'Apple.
+//
+// appleIdToken implémente l'interface ClaimsValidator
+func (c *appleIdTokenClaims) Validate() error {
+
+	// 1. vérifier que l'issuer est bien "https://appleid.apple.com"
+	// 2. vérifier que l'audience est bien le nom de mon app cliente
+
+	return nil
 }
 
 // handleAppleIOS permet de traiter les demandes d'authentification d'un 
@@ -467,16 +499,8 @@ func (s *APIServer) handleAppleIOS(w http.ResponseWriter, r *http.Request) error
 		log.Println("le corps de la requête ne correspond pas au format appleAuthRequest")
 		return respondWithError(w, http.StatusBadRequest, "mauvaise requête")
 	}
-
-	// ATTENTION:
-	// Il faut vérifier auprès d'apple que les données fournies par le client sont valides
-	// avant de renvoyer notre accès token.
-	// 
-	// TODO: 
-	// Implémenter la logique de vérification par Apple des données reçues
-
-	// générer un token d'accès pour l'utilisateur
-	accessToken, err := generateAccessToken(*requestBody.GivenName, *requestBody.Email, true)
+	
+	accessToken, err := verifyAndCreateAccessToken(requestBody)
 	if err != nil {
 		return err
 	}
@@ -500,11 +524,14 @@ func (s *APIServer) handleAppleIOS(w http.ResponseWriter, r *http.Request) error
 // Afin de vérifier l'identity token reçu du client nous devons:
 // 1. Vérifier la signature JWS E256 en utilisant la clé publique de notre serveur
 // 2. Vérifier le nonce utilisé pour l'authentification
-// 3. Vérifier que le champs contient https://appleid.apple.com
-// 4. Vérifier que le champs "aud" correspond à notre client_id de développeur
-// 5. Vérifier que la date d'expiration du token "exp" n'est pas dépassée
+// 3. Vérifier que le champs contient https://appleid.apple.com 				// fait dans la appleIdTokenClaims.Validate()
+// 4. Vérifier que le champs "aud" correspond à notre client_id de développeur	// fait dans la appleIdTokenClaims.Validate()
+// 5. Vérifier que la date d'expiration du token "exp" n'est pas dépassée		// fait dans la appleIdTokenClaims.Validate()
 //
 // voir https://developer.apple.com/documentation/signinwithapple/verifying-a-user
+//
+// Un pointeur nil sur l'access token est renvoyé seulement si l'erreur renvoyée
+// est non-nil.
 func verifyAndCreateAccessToken(data appleAuthRequest) (*string, error) {
 
 	// vérifier s'il s'agit de la première demande d'authentification avec Apple
@@ -513,18 +540,52 @@ func verifyAndCreateAccessToken(data appleAuthRequest) (*string, error) {
 		isFirstSigninWithApple = true
 	} 
 
+	// débug
 	fmt.Println(isFirstSigninWithApple)
 
 	// 1. Vérifier la signature JWS E256 en utilisant la clé publique de notre serveur
-	// // vérifier la signature du de l'identity token
-	// idToken, ok := getValidatedAppleIdToken(data.IdentityToken)
+	idToken, err := getValidatedAppleIdToken(data.IdentityToken)
+	if err != nil {
+		log.Println("identity token Apple reçu invalide")
+		return nil, err
+	}
+
+	// récupérer les claims de l'identity token
+	idTokenClaims, ok := idToken.Claims.(appleIdTokenClaims)
+	if !ok {
+		log.Printf("les claims de l'id token ne sont pas au bon format")
+		return nil, errors.New("format des claims de l'identity token invalide")
+	}
 
 	// 2. Vérifier le nonce utilisé pour l'authentification
-	// 3. Vérifier que le champs contient https://appleid.apple.com
-	// 4. Vérifier que le champs "aud" correspond à notre client_id de développeur
-	// 5. Vérifier que la date d'expiration du token "exp" n'est pas dépassée
+	if idTokenClaims.NonceSupported {
+		if data.RawNonce != idTokenClaims.Nonce {
+			log.Printf("le nonce fournit par l'utilisateur: %s\n n'est pas le même que celui de l'identity token: %s\n", data.RawNonce, idTokenClaims.Nonce)
+			return nil, errors.New("nonce invalide")
+		}
+	} else {
+		// TODO: vérifier que la fonction hashAndEncodeNonce renvoie le bon format de nonce hashé encodé
+		encodedHashedNonce := hashAndEncodeNonce(data.RawNonce)
 
-	return nil, nil
+		if data.RawNonce != encodedHashedNonce {
+			log.Printf("le nonce fournit par l'utilisateur: %s\n n'est pas le même que celui de l'identity token encodé: %s\n", data.RawNonce, encodedHashedNonce)
+			return nil, errors.New("nonce invalide")
+		}
+	}
+
+	// NOTE:	à ce moment, nous sommes sûr les informations de l'identity token son fiables
+	// NOTE:	l'identifiant utilisateur Apple est contenu dans le champs "sub" de l'identity token
+	// NOTE:	ajouter les informations de l'utilisateur à la base de données s'il s'agit de sa
+	//			première connexion avec Apple.
+
+	accessToken, err := generateAccessToken(idTokenClaims.Email, *data.GivenName, idTokenClaims.EmailVerified)
+	if err != nil {
+		return nil, err
+	}
+
+	// NOTE:	créer un refresh token ici si nous en utilisons
+
+	return accessToken, nil
 }
 
 // appleJWK (JSON Web Key) représente une clé publique utilisée pour vérifier les
@@ -544,7 +605,7 @@ type appleJWKSet struct {
 }
 
 // getValidatedAppleIdToken permet d'obtenir l'identity token transmit par
-// Apple à l'utilisateur vérifié, au format *jwt.Token
+// Apple à l'utilisateur vérifié, au format *jwt.Token.
 func getValidatedAppleIdToken(idTokenStr string) (*jwt.Token, error) {
 	
 	return jwt.ParseWithClaims(idTokenStr, &appleIdTokenClaims{}, func(token *jwt.Token) (any, error) {
@@ -604,7 +665,7 @@ func getCorrespondingApplePublicKey(kid string) (*rsa.PublicKey, error) {
 // getAppleJWKSet permet de récupérer les clés JWK utilisées par Apple
 //
 // la fonction renvoi un JWKSet nil seulement si l'erreur renvoyée est
-// non nil
+// non nil.
 func getAppleJWKSet() (*appleJWKSet, error) {
 	
 	// récupérer les clés publiques de signature des jwt Apple
@@ -652,7 +713,7 @@ func jwkToRSAPublicKey(JWK appleJWK) (*rsa.PublicKey, error) {
 // paramètre de la clé publique rsa en encodé sous la forme de valeur Base64urlUInt
 //
 // La fonction renvoie un pointeur nil sur un big.Int seulement si l'erreur
-// renvoyée est non-nil
+// renvoyée est non-nil.
 func convertBase64urlUIntToBigInt(encodedStr string) (*big.Int, error) {
 
 	// décoder la chaîne de caractères encodée reçue 
@@ -667,6 +728,24 @@ func convertBase64urlUIntToBigInt(encodedStr string) (*big.Int, error) {
 	decodedUInt := new(big.Int).SetBytes(buf)
 
 	return decodedUInt, nil
+}
+
+// hashAndEncodeNonce permet de hasher le nonce envoyé en clair dans la requête
+// d'authentification avec Apple, puis d'encoder le hash au format base44url, et
+// de renvoyer le résultat.
+func hashAndEncodeNonce(nonce string) string {
+
+	// hasher le nonce
+	hashedNonce := sha256.New()
+	hashedNonce.Write([]byte(nonce))
+
+	// encoder le hash du nonce au format base64url
+	hashedNonceBuf := hashedNonce.Sum(nil)
+	encodedHashedNonceBuf := make([]byte, base64.RawURLEncoding.EncodedLen(len(hashedNonceBuf)))
+
+	base64.RawURLEncoding.Encode(encodedHashedNonceBuf, hashedNonceBuf)
+
+	return string(encodedHashedNonceBuf)
 }
 
 // UTILS
